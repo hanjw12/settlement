@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
 <title>N빵 정산기</title>
 <style>
 :root {
@@ -148,7 +150,8 @@ function commit() { save(); render(); }
 function select(sheet) { state = sheet; commit(); }
 
 const person = id => state.people.find(p => p.id === id);
-const parseAmount = v => Math.max(0, Math.round(Number(String(v).replace(/[^\d.]/g, '')) || 0));
+const MAX_AMOUNT = 1e12;
+const parseAmount = v => Math.min(MAX_AMOUNT, Math.max(0, Math.round(Number(String(v).replace(/[^\d.]/g, '')) || 0)));
 
 // 한 건을 대상자에게 균등 배분. 1원 단위 나머지는 대상자 순서대로 1원씩 더 부담.
 function shares(ex) {
@@ -350,6 +353,8 @@ function copyText(text, msg) {
 }
 
 // 공유 링크: 정산 내용을 압축해 URL 해시(#s=...)에 담는다. 서버 저장 없음.
+// 링크는 누구나 만들 수 있으므로 읽을 때 크기·개수를 제한한다.
+const MAX_LINK = 20000, MAX_JSON = 1 << 20, MAX_PEOPLE = 100, MAX_EXPENSES = 1000;
 function b64url(bytes) {
   let bin = '';
   bytes.forEach(b => { bin += String.fromCharCode(b); });
@@ -359,8 +364,21 @@ function unb64url(str) {
   const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/'));
   return Uint8Array.from(bin, c => c.charCodeAt(0));
 }
-async function pipe(bytes, stream) {
-  return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer());
+async function pipe(bytes, stream, limit = Infinity) {
+  const reader = new Blob([bytes]).stream().pipeThrough(stream).getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > limit) { reader.cancel(); throw new Error('too large'); }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(size);
+  let off = 0;
+  chunks.forEach(c => { out.set(c, off); off += c.length; });
+  return out;
 }
 async function encodeSheet(s) {
   const idx = Object.fromEntries(s.people.map((p, i) => [p.id, i]));
@@ -374,17 +392,19 @@ async function encodeSheet(s) {
   return 'j' + b64url(bytes);
 }
 async function decodeSheet(str) {
+  if (str.length > MAX_LINK) throw new Error('too large');
   let bytes = unb64url(str.slice(1));
-  if (str[0] === 'z') bytes = await pipe(bytes, new DecompressionStream('deflate-raw'));
+  if (str[0] === 'z') bytes = await pipe(bytes, new DecompressionStream('deflate-raw'), MAX_JSON);
   const d = JSON.parse(new TextDecoder().decode(bytes));
-  if (!Array.isArray(d.p) || !Array.isArray(d.e)) throw new Error('bad data');
-  const people = d.p.map(([name, color], i) => ({ id: uid(), name: String(name), color: COLORS.includes(color) ? color : COLORS[i % COLORS.length] }));
+  if (!Array.isArray(d.p) || !Array.isArray(d.e) || d.p.length > MAX_PEOPLE || d.e.length > MAX_EXPENSES) throw new Error('bad data');
+  const text = (v, max) => String(v == null ? '' : v).slice(0, max);
+  const people = d.p.map(([name, color], i) => ({ id: uid(), name: text(name, 40), color: COLORS.includes(color) ? color : COLORS[i % COLORS.length] }));
   const expenses = d.e.map(([name, amount, pi, ms]) => ({
-    id: uid(), name: String(name || ''), amount: parseAmount(amount),
+    id: uid(), name: text(name, 100), amount: parseAmount(amount),
     payer: people[pi] ? people[pi].id : '',
     members: (Array.isArray(ms) ? ms : []).map(i => people[i] && people[i].id).filter(Boolean)
   }));
-  return { id: typeof d.i === 'string' ? d.i : uid(), title: String(d.t || ''), people, expenses };
+  return { id: typeof d.i === 'string' && /^\w{1,20}$/.test(d.i) ? d.i : uid(), title: text(d.t, 100), people, expenses };
 }
 
 async function importFromHash() {
@@ -404,7 +424,7 @@ async function importFromHash() {
 }
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
-function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 1600); }
+function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), msg.length > 20 ? 3000 : 1600); }
 
 function removePerson(id) {
   const used = state.expenses.some(ex => ex.payer === id);
@@ -464,7 +484,7 @@ $('delSheet').onclick = () => {
 };
 $('share').onclick = async () => {
   if (!state.people.length) { toast('공유할 내용이 없습니다'); return; }
-  copyText(location.href.split('#')[0] + '#s=' + await encodeSheet(state), '공유 링크를 복사했습니다');
+  copyText(location.href.split('#')[0] + '#s=' + await encodeSheet(state), '링크를 복사했습니다 · 링크를 가진 누구나 내용을 볼 수 있어요');
 };
 window.addEventListener('hashchange', importFromHash);
 
