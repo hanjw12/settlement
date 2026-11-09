@@ -5,24 +5,26 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; connect-src https://jzwilhkfgnmnacvopmfb.supabase.co; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
+<script>try { var t = localStorage.getItem('settlement-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}</script>
 <title>N빵 정산기</title>
 <style>
 :root {
   --bg: #f5f6f8; --card: #fff; --text: #1d2129; --muted: #6b7280; --line: #e5e7eb;
   --accent: #e6007e; --accent-soft: #fde7f3; --plus: #0a7d4f; --minus: #c62828;
-  --chip-off: #f1f2f4; --shadow: 0 1px 3px rgba(0,0,0,.06);
+  --chip-off: #f1f2f4; --shadow: 0 1px 3px rgba(0,0,0,.06); color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #111317; --card: #1b1e24; --text: #e8eaed; --muted: #9aa0a6; --line: #2c3038;
-    --accent: #ff4fa8; --accent-soft: #3a1a2c; --plus: #4cc38a; --minus: #ff6b6b; --chip-off: #262a31;
+    --accent: #ff4fa8; --accent-soft: #3a1a2c; --plus: #4cc38a; --minus: #ff6b6b; --chip-off: #262a31; color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --bg: #111317; --card: #1b1e24; --text: #e8eaed; --muted: #9aa0a6; --line: #2c3038;
-  --accent: #ff4fa8; --accent-soft: #3a1a2c; --plus: #4cc38a; --minus: #ff6b6b; --chip-off: #262a31;
+  --accent: #ff4fa8; --accent-soft: #3a1a2c; --plus: #4cc38a; --minus: #ff6b6b; --chip-off: #262a31; color-scheme: dark;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--text);
   font-family: Pretendard, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif; font-size: 15px; }
 main { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
@@ -43,10 +45,25 @@ input[type=text], input[type=number], select {
   font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
   border-radius: 10px; padding: 9px 11px; min-width: 0; }
 input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+/* 기본 화살표는 어두운 배경에서 안 보이는 기기가 있어 직접 그린다 (CSP 때문에 이미지 대신 그라데이션) */
+select { -webkit-appearance: none; appearance: none; padding-right: 30px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text) 50%), linear-gradient(135deg, var(--text) 50%, transparent 50%);
+  background-position: calc(100% - 17px) 50%, calc(100% - 12px) 50%; background-size: 5px 5px; background-repeat: no-repeat; }
+#theme, .toolbar button { white-space: nowrap; }
+@media (max-width: 640px) {
+  .toolbar { flex-wrap: wrap; }
+  .toolbar select { flex: 1 1 100%; }
+  .toolbar button { flex: 1 1 auto; }
+}
+/* 금액 칸: 굵게 + 단위 표시 */
+.money { position: relative; display: block; min-width: 0; }
+.money input { width: 100%; font-weight: 700; font-size: 17px; text-align: right; padding-right: 32px; border-color: var(--accent); }
+.money input::placeholder { font-weight: 500; font-size: 15px; }
+.money::after { content: '원'; position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font-weight: 700; color: var(--text); pointer-events: none; }
 button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--text); padding: 9px 14px; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-button.ghost { border: none; background: transparent; color: var(--muted); padding: 6px 8px; }
-button.ghost:hover { color: var(--minus); }
+button.ghost { background: transparent; color: var(--text); padding: 6px 10px; }
+button.ghost:hover { color: var(--minus); border-color: var(--minus); }
 button.small { padding: 5px 10px; font-size: 13px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px;
@@ -97,6 +114,7 @@ th { font-size: 13px; color: var(--muted); font-weight: 500; }
   <div id="syncStatus" class="sync" hidden></div>
   <header>
     <input id="title" type="text" aria-label="정산 제목" placeholder="정산 제목 (예: 제주 여행)">
+    <button id="theme" class="small" type="button"></button>
   </header>
 
   <section>
@@ -112,7 +130,7 @@ th { font-size: 13px; color: var(--muted); font-weight: 500; }
     <h2>② 사용 금액 <span class="count" id="expenseCount"></span></h2>
     <form id="expenseForm" class="add-form">
       <input class="name-in" id="exName" type="text" placeholder="내용 (예: 1차 저녁)">
-      <input id="exAmount" type="text" inputmode="numeric" placeholder="금액">
+      <span class="money"><input id="exAmount" type="text" inputmode="numeric" placeholder="사용 금액" aria-label="사용 금액(원)"></span>
       <select id="exPayer" aria-label="결제자"></select>
       <button class="primary" type="submit">추가</button>
     </form>
@@ -277,7 +295,11 @@ function expenseRow(ex) {
 
   const amt = document.createElement('input');
   amt.type = 'text'; amt.inputMode = 'numeric'; amt.className = 'num'; amt.value = ex.amount.toLocaleString('ko-KR');
+  amt.setAttribute('aria-label', '사용 금액(원)');
   amt.onchange = () => { ex.amount = parseAmount(amt.value); commit(); };
+  const money = document.createElement('span');
+  money.className = 'money';
+  money.append(amt);
 
   const payer = document.createElement('select');
   payer.setAttribute('aria-label', '결제자');
@@ -290,7 +312,7 @@ function expenseRow(ex) {
   del.type = 'button'; del.className = 'ghost'; del.textContent = '삭제';
   del.onclick = () => { state.expenses = state.expenses.filter(e => e !== ex); commit(); };
 
-  top.append(name, amt, payer, del);
+  top.append(name, money, payer, del);
 
   const split = document.createElement('div');
   split.className = 'expense-split';
@@ -644,6 +666,22 @@ $('share').onclick = async () => {
   if (!state.people.length) { toast('공유할 내용이 없습니다'); return; }
   copyText(location.href.split('#')[0] + '#s=' + await encodeSheet(state), '링크를 복사했습니다 · 링크를 가진 누구나 내용을 볼 수 있어요');
 };
+// 테마: 처음에는 휴대폰 설정을 따르고, 버튼으로 고르면 이 기기에 기억한다
+const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+const isDark = () => (document.documentElement.dataset.theme || (darkQuery.matches ? 'dark' : 'light')) === 'dark';
+function renderTheme() {
+  $('theme').textContent = isDark() ? '☀️ 밝게' : '🌙 어둡게';
+  $('theme').setAttribute('aria-label', isDark() ? '밝은 테마로 전환' : '어두운 테마로 전환');
+}
+$('theme').onclick = () => {
+  const t = isDark() ? 'light' : 'dark';
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('settlement-theme', t); } catch (e) {}
+  renderTheme();
+};
+darkQuery.addEventListener('change', renderTheme);
+renderTheme();
+
 $('liveShare').onclick = startLive;
 window.addEventListener('hashchange', importFromHash);
 if (ONLINE) {
