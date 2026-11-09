@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; connect-src https://jzwilhkfgnmnacvopmfb.supabase.co; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>N빵 정산기</title>
 <style>
@@ -28,6 +28,10 @@ body { margin: 0; background: var(--bg); color: var(--text);
 main { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
 .toolbar { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
 .toolbar select { flex: 1; padding: 6px 10px; font-size: 14px; }
+.sync { font-size: 13px; color: var(--muted); margin: 0 0 8px; display: flex; align-items: center; gap: 6px; }
+.sync::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--plus); }
+.sync.err::before { background: var(--minus); }
+.sync.err { color: var(--minus); }
 header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 header input { flex: 1; font-size: 22px; font-weight: 700; border: none; background: transparent; color: var(--text); padding: 4px 0; }
 header input:focus { outline: none; border-bottom: 2px solid var(--accent); }
@@ -86,9 +90,11 @@ th { font-size: 13px; color: var(--muted); font-weight: 500; }
   <div class="toolbar">
     <select id="sheetSel" aria-label="정산 목록"></select>
     <button id="newSheet" class="small" type="button">+ 새 정산</button>
+    <button id="liveShare" class="small primary" type="button" hidden>실시간 공유</button>
     <button id="share" class="small" type="button">링크 공유</button>
     <button id="delSheet" class="ghost small" type="button">삭제</button>
   </div>
+  <div id="syncStatus" class="sync" hidden></div>
   <header>
     <input id="title" type="text" aria-label="정산 제목" placeholder="정산 제목 (예: 제주 여행)">
   </header>
@@ -121,6 +127,13 @@ th { font-size: 13px; color: var(--muted); font-weight: 500; }
 <div class="toast" id="toast"></div>
 
 <script>
+// 실시간 공유(Supabase). 둘 중 하나라도 비우면 실시간 기능이 숨겨지고
+// 기존 방식(브라우저 저장 + 링크 공유)만 동작한다. 롤백할 때는 이 두 값을 비우면 된다.
+// CSP 메타 태그의 connect-src 도 같은 주소로 맞춰야 한다.
+const SUPABASE_URL = 'https://jzwilhkfgnmnacvopmfb.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_cdS0cFgPDgtDnZTirw9yQw_hMbWif9P';
+const ONLINE = !!(SUPABASE_URL && SUPABASE_KEY);
+
 const KEY = 'settlement-system-v2';
 const OLD_KEY = 'settlement-system-v1';
 const COLORS = ['#e6007e','#2f80ed','#27ae60','#f2994a','#9b51e0','#eb5757','#00a3a3','#c9a400','#6d4c41','#546e7a'];
@@ -146,10 +159,11 @@ function loadDb() {
   return { current: first.id, sheets: [first] };
 }
 function save() { db.current = state.id; try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) {} }
-function commit() { save(); render(); }
+function commit() { save(); render(); if (state.room) runSync(); }
 function select(sheet) { state = sheet; commit(); }
 
 const person = id => state.people.find(p => p.id === id);
+const clip = (v, max) => String(v == null ? '' : v).slice(0, max);
 const MAX_AMOUNT = 1e12;
 const parseAmount = v => Math.min(MAX_AMOUNT, Math.max(0, Math.round(Number(String(v).replace(/[^\d.]/g, '')) || 0)));
 
@@ -210,6 +224,9 @@ function render() {
   ss.innerHTML = '';
   db.sheets.forEach(s => ss.append(new Option((s.title || '제목 없는 정산') + ` · ${s.people.length}명 ${s.expenses.length}건`, s.id)));
   ss.value = state.id;
+  $('liveShare').hidden = !ONLINE;
+  $('liveShare').textContent = state.room ? '실시간 링크 복사' : '실시간 공유';
+  renderSync();
 
   $('title').value = state.title;
   $('peopleCount').textContent = state.people.length ? state.people.length + '명' : '';
@@ -397,20 +414,159 @@ async function decodeSheet(str) {
   if (str[0] === 'z') bytes = await pipe(bytes, new DecompressionStream('deflate-raw'), MAX_JSON);
   const d = JSON.parse(new TextDecoder().decode(bytes));
   if (!Array.isArray(d.p) || !Array.isArray(d.e) || d.p.length > MAX_PEOPLE || d.e.length > MAX_EXPENSES) throw new Error('bad data');
-  const text = (v, max) => String(v == null ? '' : v).slice(0, max);
-  const people = d.p.map(([name, color], i) => ({ id: uid(), name: text(name, 40), color: COLORS.includes(color) ? color : COLORS[i % COLORS.length] }));
-  const expenses = d.e.map(([name, amount, pi, ms]) => ({
-    id: uid(), name: text(name, 100), amount: parseAmount(amount),
+  const people = d.p.map(([name, color], i) => ({ id: uid(), name: clip(name, 40), color: COLORS.includes(color) ? color : COLORS[i % COLORS.length], pos: i }));
+  const expenses = d.e.map(([name, amount, pi, ms], i) => ({
+    id: uid(), name: clip(name, 100), amount: parseAmount(amount), pos: i,
     payer: people[pi] ? people[pi].id : '',
     members: (Array.isArray(ms) ? ms : []).map(i => people[i] && people[i].id).filter(Boolean)
   }));
-  return { id: typeof d.i === 'string' && /^\w{1,20}$/.test(d.i) ? d.i : uid(), title: text(d.t, 100), people, expenses };
+  return { id: typeof d.i === 'string' && /^\w{1,20}$/.test(d.i) ? d.i : uid(), title: clip(d.t, 100), people, expenses };
+}
+
+// 실시간 공유: 정산 하나가 Supabase 의 공유방(room) 하나에 대응한다.
+// 마지막으로 서버와 맞춘 상태(synced)와 비교해 바뀐 행만 올리고, 서버가 바뀌었으면 다시 받아온다.
+// 같은 건을 동시에 고치면 나중에 저장한 쪽이 남는다.
+const POLL_MS = 3000;
+const sync = { busy: false, again: false, error: '', pendingRender: false };
+
+function roomId() { return b64url(crypto.getRandomValues(new Uint8Array(16))); }
+function roomLink(r) { return location.href.split('#')[0] + '#r=' + r; }
+
+async function api(room, method, path, body, prefer) {
+  const headers = { apikey: SUPABASE_KEY, 'x-room-id': room };
+  if (body) headers['Content-Type'] = 'application/json';
+  if (prefer) headers.Prefer = prefer;
+  const res = await fetch(SUPABASE_URL + '/rest/v1/' + path, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store' });
+  if (!res.ok) throw new Error(res.status + ' ' + (await res.text()).slice(0, 200));
+  return (res.headers.get('content-type') || '').includes('json') && res.status !== 204 ? res.json() : null;
+}
+
+function rowsOf(s) {
+  return {
+    title: s.title,
+    people: Object.fromEntries(s.people.map(p => [p.id, JSON.stringify([p.name, p.color, p.pos ?? 0])])),
+    expenses: Object.fromEntries(s.expenses.map(e => [e.id, JSON.stringify([e.name, e.amount, e.payer, e.members, e.pos ?? 0])]))
+  };
+}
+
+async function push(s) {
+  const now = rowsOf(s), base = s.synced || { title: null, people: {}, expenses: {} }, r = s.room;
+  if (now.title !== base.title) await api(r, 'PATCH', 'rooms?id=eq.' + r, { title: s.title }, 'return=minimal');
+  const tables = [
+    ['people', s.people, p => ({ room_id: r, id: p.id, name: p.name, color: p.color, pos: p.pos ?? 0 })],
+    ['expenses', s.expenses, e => ({ room_id: r, id: e.id, name: e.name, amount: e.amount, payer: e.payer, members: e.members, pos: e.pos ?? 0 })]
+  ];
+  for (const [table, items, toRow] of tables) {
+    const changed = items.filter(x => now[table][x.id] !== base[table][x.id]).map(toRow);
+    const gone = Object.keys(base[table]).filter(id => !(id in now[table]));
+    if (changed.length) await api(r, 'POST', table + '?on_conflict=room_id,id', changed, 'resolution=merge-duplicates,return=minimal');
+    if (gone.length) await api(r, 'DELETE', table + '?id=in.(' + gone.map(encodeURIComponent).join(',') + ')', null, 'return=minimal');
+  }
+  return now;
+}
+
+// 서버의 방이 마지막으로 받은 뒤 바뀌었을 때만 전체를 받아온다
+async function fetchRoom(s) {
+  const r = s.room;
+  const [room] = await api(r, 'GET', 'rooms?select=title,updated_at&id=eq.' + r);
+  if (!room) throw new Error('not found');
+  if (room.updated_at === s.stamp) return null;
+  const [people, expenses] = await Promise.all([
+    api(r, 'GET', 'people?select=id,name,color,pos&order=pos,id'),
+    api(r, 'GET', 'expenses?select=id,name,amount,payer,members,pos&order=pos,id')
+  ]);
+  return { room, people, expenses };
+}
+
+function applyRemote(s, { room, people, expenses }) {
+  const before = JSON.stringify(rowsOf(s));
+  // 기존 객체를 제자리에서 고친다. 화면의 입력칸 핸들러가 그 객체를 붙잡고 있어서,
+  // 새 객체로 바꾸면 입력 중이던 수정이 떨어져 나간 객체에 저장되어 사라진다.
+  const keep = (old, fresh) => fresh.map(x => { const o = old.find(y => y.id === x.id); return o ? Object.assign(o, x) : x; });
+  s.title = clip(room.title, 100);
+  s.people = keep(s.people, people.map((p, i) => ({ id: clip(p.id, 20), name: clip(p.name, 40), color: COLORS.includes(p.color) ? p.color : COLORS[i % COLORS.length], pos: Number(p.pos) || 0 })));
+  s.expenses = keep(s.expenses, expenses.map(e => ({
+    id: clip(e.id, 20), name: clip(e.name, 100), amount: parseAmount(e.amount), payer: clip(e.payer, 20),
+    members: (Array.isArray(e.members) ? e.members : []).map(m => clip(m, 20)), pos: Number(e.pos) || 0
+  })));
+  s.stamp = room.updated_at;
+  s.synced = rowsOf(s);
+  return JSON.stringify(s.synced) !== before;
+}
+
+async function runSync() {
+  const s = state;
+  if (!ONLINE || !s.room) return;
+  if (sync.busy) { sync.again = true; return; }
+  sync.busy = true;
+  let changed = false;
+  try {
+    do {
+      sync.again = false;
+      s.synced = await push(s);
+      const remote = await fetchRoom(s);
+      if (sync.again) continue; // 받는 사이 로컬 수정이 생기면 그것부터 올린다
+      if (remote) changed = applyRemote(s, remote) || changed;
+    } while (sync.again);
+    sync.error = '';
+  } catch (e) {
+    sync.error = /not found/.test(e.message) ? '공유방을 찾을 수 없습니다' : '연결 끊김 · 다시 연결 중…';
+  }
+  sync.busy = false;
+  save();
+  if (changed && s === state) renderRemote(); else renderSync();
+}
+
+// 다른 사람의 수정이 들어와도 지금 입력 중인 칸은 덮어쓰지 않는다
+function renderRemote() {
+  const a = document.activeElement;
+  if (a && (a.id === 'title' || a.closest('#expenses'))) { sync.pendingRender = true; renderSync(); return; }
+  render();
+}
+document.addEventListener('focusout', () => setTimeout(() => {
+  if (sync.pendingRender) { sync.pendingRender = false; renderRemote(); }
+}, 0));
+
+function renderSync() {
+  const el = $('syncStatus');
+  el.hidden = !(ONLINE && state.room);
+  el.classList.toggle('err', !!sync.error);
+  el.textContent = sync.error || '실시간 공유 중 · 링크를 받은 사람과 함께 편집됩니다';
+}
+
+async function startLive() {
+  const s = state;
+  if (!s.room) {
+    if (!s.people.length) { toast('참여자를 먼저 추가하세요'); return; }
+    const r = roomId();
+    try { await api(r, 'POST', 'rooms', { id: r, title: s.title }, 'return=minimal'); }
+    catch (e) { toast('실시간 공유를 시작하지 못했습니다'); return; }
+    s.people.forEach((p, i) => { if (p.pos == null) p.pos = i; });
+    s.expenses.forEach((e, i) => { if (e.pos == null) e.pos = i; });
+    s.room = r; s.synced = null; s.stamp = null;
+    commit();
+  }
+  copyText(roomLink(s.room), '실시간 링크를 복사했습니다 · 링크를 가진 누구나 함께 수정할 수 있어요');
+}
+
+function joinRoom(r) {
+  if (!ONLINE) { toast('실시간 공유가 꺼져 있습니다'); return; }
+  let s = db.sheets.find(x => x.room === r);
+  if (!s) {
+    s = { ...blank(), room: r, stamp: null };
+    s.synced = rowsOf(s); // 빈 상태를 기준으로 삼아 아무것도 올리지 않고 받기만 한다
+    db.sheets = db.sheets.filter(x => x.title || x.people.length || x.expenses.length);
+    db.sheets.unshift(s);
+  }
+  select(s);
 }
 
 async function importFromHash() {
+  const live = location.hash.match(/^#r=([\w-]{20,40})$/);
   const m = location.hash.match(/^#s=([\w-]+)$/);
-  if (!m) return;
+  if (!m && !live) return;
   try { history.replaceState(null, '', location.pathname + location.search); } catch (e) { location.hash = ''; }
+  if (live) { joinRoom(live[1]); return; }
   let s;
   try { s = await decodeSheet(m[1]); } catch (e) { toast('공유 링크를 읽을 수 없습니다'); return; }
   // 아무것도 입력하지 않은 빈 정산은 공유본으로 대체
@@ -440,10 +596,11 @@ function removePerson(id) {
 $('personForm').onsubmit = e => {
   e.preventDefault();
   const names = $('personName').value.split(',').map(s => s.trim()).filter(Boolean);
-  names.forEach(name => {
+  names.forEach((name, i) => {
+    name = clip(name, 40);
     if (state.people.some(p => p.name === name)) return;
     const color = COLORS[state.people.length % COLORS.length];
-    state.people.push({ id: uid(), name, color });
+    state.people.push({ id: uid(), name, color, pos: Date.now() + i });
   });
   $('personName').value = '';
   commit();
@@ -456,8 +613,8 @@ $('expenseForm').onsubmit = e => {
   const amount = parseAmount($('exAmount').value);
   if (!amount) { toast('금액을 입력하세요'); $('exAmount').focus(); return; }
   state.expenses.push({
-    id: uid(), name: $('exName').value.trim() || ('항목 ' + (state.expenses.length + 1)),
-    amount, payer: $('exPayer').value, members: state.people.map(p => p.id)
+    id: uid(), name: clip($('exName').value.trim(), 100) || ('항목 ' + (state.expenses.length + 1)),
+    amount, payer: $('exPayer').value, members: state.people.map(p => p.id), pos: Date.now()
   });
   $('exName').value = ''; $('exAmount').value = '';
   commit();
@@ -477,7 +634,8 @@ $('newSheet').onclick = () => {
   $('title').focus();
 };
 $('delSheet').onclick = () => {
-  if ((state.people.length || state.expenses.length) && !confirm(`"${state.title || '제목 없는 정산'}"을(를) 삭제할까요?`)) return;
+  const note = state.room ? '\n내 목록에서만 지워지고, 함께 쓰는 사람들의 공유방은 그대로 남습니다.' : '';
+  if ((state.people.length || state.expenses.length) && !confirm(`"${state.title || '제목 없는 정산'}"을(를) 삭제할까요?${note}`)) return;
   db.sheets = db.sheets.filter(s => s !== state);
   if (!db.sheets.length) db.sheets.push(blank());
   select(db.sheets[0]);
@@ -486,10 +644,16 @@ $('share').onclick = async () => {
   if (!state.people.length) { toast('공유할 내용이 없습니다'); return; }
   copyText(location.href.split('#')[0] + '#s=' + await encodeSheet(state), '링크를 복사했습니다 · 링크를 가진 누구나 내용을 볼 수 있어요');
 };
+$('liveShare').onclick = startLive;
 window.addEventListener('hashchange', importFromHash);
+if (ONLINE) {
+  setInterval(() => { if (!document.hidden) runSync(); }, POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) runSync(); });
+}
 
 render();
 importFromHash();
+runSync();
 </script>
 </body>
 </html>
